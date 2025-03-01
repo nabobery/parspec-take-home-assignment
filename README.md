@@ -58,7 +58,7 @@ The service is designed with extensibility in mind:
 1. Clone the repository:
 
 ```bash
-git clone https://github.com/nabobery/parspec-take-home-assignment.git
+git clone https://github.com/nabobery/parspec-take-home-assignment.git url-shortener
 cd url-shortener
 ```
 
@@ -157,7 +157,7 @@ Response:
 ### Cleanup Expired URLs
 
 ```bash
-GET /cleanup
+POST /cleanup
 ```
 
 Response:
