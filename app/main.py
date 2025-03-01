@@ -1,14 +1,22 @@
-from fastapi import FastAPI, HTTPException, Request, Depends
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime, timedelta
-from .models import URLInput, URLResponse, URLStats
-from .utils import generate_short_code, cleanup_expired_urls, get_url_mapping
-from .config import DEFAULT_EXPIRATION_DAYS
+from app.models import URLInput, URLResponse, URLStats
+from app.redis_client import (
+    set_url_data,
+    get_url_data,
+    delete_url_data,
+    get_all_keys,
+    cleanup_expired_urls
+)
+from app.config import settings
+from app.utils import generate_short_code
 
+# APP definition
 app = FastAPI(title="URL Shortener Service", version="1.0.0")
 
-# Add CORS middleware
+# Added CORS middleware to app
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # Allows all origins
@@ -17,6 +25,7 @@ app.add_middleware(
     allow_headers=["*"],  # Allows all headers
 )
 
+# Welcome endpoint to get details of all available endpoints
 @app.get("/")
 def read_root():
     """Welcome endpoint with basic service information."""
@@ -37,50 +46,51 @@ def shorten_url(url_input: URLInput, request: Request):
     """Create a shortened URL."""
     # Cleanup expired URLs in the background
     cleanup_expired_urls()
-    
-    url_mapping = get_url_mapping()
-    
+
     # Normalize the URL
     original_url = str(url_input.url)
-    
+
     # Check if the URL has already been shortened
-    for code, data in url_mapping.items():
-        if data["original_url"] == original_url and not (data.get("expiration_date") and data["expiration_date"] < datetime.now()):
+    # TODO: Have to optimize this by using reverse lookup of original url and short code
+    for key in get_all_keys():
+        data = get_url_data(key)
+        if data and data.get("original_url") == original_url:
+            exp_date = data.get("expiration_date")
+            # if expired, go to generate short code
+            if exp_date and datetime.fromisoformat(exp_date) < datetime.now():
+                continue
             # Update expiration if it's changed
             if url_input.expiration_days:
-                data["expiration_date"] = datetime.now() + timedelta(days=url_input.expiration_days)
-            
+                new_expiration = datetime.now() + timedelta(days=url_input.expiration_days)
+                data["expiration_date"] = new_expiration.isoformat()
+                set_url_data(key, data)
+            # just return the shortened url after we found it
             base_url = f"{request.url.scheme}://{request.url.netloc}"
-            short_url = f"{base_url}/{code}"
-            
+            short_url = f"{base_url}/{key}"
             return URLResponse(
                 original_url=original_url,
                 short_url=short_url,
-                expiration_date=data["expiration_date"],
-                access_count=data["access_count"]
+                expiration_date=datetime.fromisoformat(data["expiration_date"]),
+                access_count=data.get("access_count", 0)
             )
-    
+
     # Generate a new short code 
     short_code = generate_short_code()
-    
-    # Check if custom code is already in use
-    if short_code in url_mapping:
-        raise HTTPException(status_code=400, detail="Custom code already in use")
-    
+
     # Calculate expiration date
-    expiration_date = datetime.now() + timedelta(days=url_input.expiration_days or DEFAULT_EXPIRATION_DAYS)
-    
-    # Store the mapping
-    url_mapping[short_code] = {
+    expiration_date = datetime.now() + timedelta(days=url_input.expiration_days or settings.DEFAULT_EXPIRATION_DAYS)
+
+    # Store the mapping in Redis
+    url_data = {
         "original_url": original_url,
-        "created_at": datetime.now(),
-        "expiration_date": expiration_date,
+        "created_at": datetime.now().isoformat(),
+        "expiration_date": expiration_date.isoformat(),
         "access_count": 0
     }
-    
+    set_url_data(short_code, url_data)
+
     base_url = f"{request.url.scheme}://{request.url.netloc}"
     short_url = f"{base_url}/{short_code}"
-    
     return URLResponse(
         original_url=original_url,
         short_url=short_url,
@@ -91,45 +101,38 @@ def shorten_url(url_input: URLInput, request: Request):
 @app.get("/{short_code}")
 def redirect_to_original(short_code: str):
     """Redirect to the original URL."""
-    url_mapping = get_url_mapping()
-    
-    # Check if the short code exists
-    if short_code not in url_mapping:
+    data = get_url_data(short_code)
+    if not data:
         raise HTTPException(status_code=404, detail="URL not found")
-    
+
     # Check if the URL has expired
-    url_data = url_mapping[short_code]
-    if url_data.get("expiration_date") and url_data["expiration_date"] < datetime.now():
-        del url_mapping[short_code]
+    exp_date = data.get("expiration_date")
+    if exp_date and datetime.fromisoformat(exp_date) < datetime.now():
+        delete_url_data(short_code)
         raise HTTPException(status_code=404, detail="URL has expired")
-    
+
     # Increment access count
-    url_mapping[short_code]["access_count"] += 1
-    
-    # Redirect to the original URL
-    return RedirectResponse(url_data["original_url"])
+    data["access_count"] = data.get("access_count", 0) + 1
+    set_url_data(short_code, data)
+
+    return RedirectResponse(data["original_url"])
 
 @app.get("/stats/{short_code}", response_model=URLStats)
 def get_url_stats(short_code: str):
     """Get statistics for a shortened URL."""
-    url_mapping = get_url_mapping()
-    
-    if short_code not in url_mapping:
+    data = get_url_data(short_code)
+    if not data:
         raise HTTPException(status_code=404, detail="URL not found")
-    
-    url_data = url_mapping[short_code]
-    
-    # Check if the URL has expired
-    if url_data.get("expiration_date") and url_data["expiration_date"] < datetime.now():
-        del url_mapping[short_code]
+    exp_date = data.get("expiration_date")
+    if exp_date and datetime.fromisoformat(exp_date) < datetime.now():
+        delete_url_data(short_code)
         raise HTTPException(status_code=404, detail="URL has expired")
-    
     return URLStats(
-        original_url=url_data["original_url"],
+        original_url=data["original_url"],
         short_code=short_code,
-        expiration_date=url_data["expiration_date"],
-        access_count=url_data["access_count"],
-        created_at=url_data["created_at"]
+        expiration_date=datetime.fromisoformat(data["expiration_date"]),
+        access_count=data.get("access_count", 0),
+        created_at=datetime.fromisoformat(data["created_at"])
     )
 
 @app.post("/cleanup")
