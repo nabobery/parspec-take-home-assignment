@@ -4,7 +4,7 @@ from datetime import datetime
 from app.config import settings
 
 # Initialize Redis client with settings
-redis = Redis(url=settings.UPTASH_REDIS_REST_URL, token=settings.UPSTASH_REDIS_REST_TOKEN)
+redis = Redis(url=settings.UPSTASH_REDIS_REST_URL, token=settings.UPSTASH_REDIS_REST_TOKEN)
 
 
 def set_url_data(short_code: str, data: dict):
